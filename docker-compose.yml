@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  retag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: retag-api:local
+    ports:
+      - "${PORT:-8080}:8080"   # Ubah PORT env di host kalau mau ganti port publish
+    environment:
+      - API_TOKEN=${API_TOKEN:-secret}
+      - APPS_ID=${APPS_ID:-retag}
+      - SERVICE_NAME=${SERVICE_NAME:-retag-api}
+      - LOG_DIR=/var/log/retag-api
+      # Opsional: auto docker login
+      - DOCKER_REGISTRY=${DOCKER_REGISTRY}
+      - DOCKER_USERNAME=${DOCKER_USERNAME}
+      - DOCKER_PASSWORD=${DOCKER_PASSWORD}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./logs:/var/log/retag-api
+    restart: unless-stopped
