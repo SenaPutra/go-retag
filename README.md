@@ -11,9 +11,15 @@ docker compose logs -f retag-api
 
 Set host port by env: `PORT=9000 docker compose up -d` (container listens on 8080).
 
-Test:
+Test (Bearer token):
 ```bash
 curl -sS -H "Authorization: Bearer ${API_TOKEN:-secret}" -H "Content-Type: application/json"   -d '{"src":"reg/stg/app:stg","dest":"reg/prod/app:prod-20251112-Rev01","dry_run":true}'   http://localhost:${PORT:-8080}/retag | jq
+```
+
+Basic auth is also supported when `BASIC_AUTH_USER` and `BASIC_AUTH_PASS` are set:
+
+```bash
+curl -sS -u "${BASIC_AUTH_USER}:${BASIC_AUTH_PASS}" -H "Content-Type: application/json"   -d '{"src":"reg/stg/app:stg","dest":"reg/prod/app:prod-20251112-Rev01","dry_run":true}'   http://localhost:${PORT:-8080}/retag | jq
 ```
 
 ## JSON Logs

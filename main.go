@@ -23,7 +23,7 @@ type RetagRequest struct {
 	Src    string `json:"src"`
 	Dest   string `json:"dest"`
 	DryRun bool   `json:"dry_run"`
-	Login *struct {
+	Login  *struct {
 		Registry string `json:"registry"`
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -50,6 +50,8 @@ type CommandResult struct {
 func main() {
 	addr := getenv("ADDR", ":8080")
 	apiToken := os.Getenv("API_TOKEN")
+	basicUser := os.Getenv("BASIC_AUTH_USER")
+	basicPass := os.Getenv("BASIC_AUTH_PASS")
 	appID := getenv("APPS_ID", "retag")
 	svcName := getenv("SERVICE_NAME", "retag-api")
 
@@ -67,7 +69,7 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	// POST /retag
-	mux.Handle("/retag", authMiddleware(apiToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/retag", authMiddleware(apiToken, basicUser, basicPass, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -99,7 +101,8 @@ func main() {
 				results = append(results, cr)
 				if cr.Code != 0 {
 					resp := RetagResponse{OK: false, Message: "docker login failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-					writeJSON(w, http.StatusUnauthorized, resp); return
+					writeJSON(w, http.StatusUnauthorized, resp)
+					return
 				}
 			}
 		} else if envHasLogin() {
@@ -114,7 +117,8 @@ func main() {
 					results = append(results, cr)
 					if cr.Code != 0 {
 						resp := RetagResponse{OK: false, Message: "docker login failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-						writeJSON(w, http.StatusUnauthorized, resp); return
+						writeJSON(w, http.StatusUnauthorized, resp)
+						return
 					}
 				}
 			}
@@ -127,7 +131,8 @@ func main() {
 			results = append(results, run(ctx, "docker", "pull", req.Src))
 			if results[len(results)-1].Code != 0 {
 				resp := RetagResponse{OK: false, Message: "docker pull failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-				writeJSON(w, http.StatusBadGateway, resp); return
+				writeJSON(w, http.StatusBadGateway, resp)
+				return
 			}
 		}
 
@@ -138,7 +143,8 @@ func main() {
 			results = append(results, run(ctx, "docker", "tag", req.Src, req.Dest))
 			if results[len(results)-1].Code != 0 {
 				resp := RetagResponse{OK: false, Message: "docker tag failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-				writeJSON(w, http.StatusBadGateway, resp); return
+				writeJSON(w, http.StatusBadGateway, resp)
+				return
 			}
 		}
 
@@ -146,12 +152,14 @@ func main() {
 		if req.DryRun {
 			results = append(results, CommandResult{Cmd: fmt.Sprintf("docker push %s", req.Dest)})
 			resp := RetagResponse{OK: true, Message: "dry-run ok", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-			writeJSON(w, http.StatusOK, resp); return
+			writeJSON(w, http.StatusOK, resp)
+			return
 		}
 		results = append(results, run(ctx, "docker", "push", req.Dest))
 		if results[len(results)-1].Code != 0 {
 			resp := RetagResponse{OK: false, Message: "docker push failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-			writeJSON(w, http.StatusBadGateway, resp); return
+			writeJSON(w, http.StatusBadGateway, resp)
+			return
 		}
 
 		resp := RetagResponse{OK: true, Message: "retag + push success", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
@@ -215,19 +223,30 @@ func must(err error) {
 
 // ===== auth (inline) =====
 
-func authMiddleware(apiToken string, next http.Handler) http.Handler {
-	if apiToken == "" {
+func authMiddleware(apiToken, basicUser, basicPass string, next http.Handler) http.Handler {
+	if apiToken == "" && basicUser == "" {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorized := false
 		h := r.Header.Get("Authorization")
-		const pfx = "Bearer "
-		if !strings.HasPrefix(h, pfx) || strings.TrimSpace(strings.TrimPrefix(h, pfx)) != apiToken {
-			w.Header().Set("WWW-Authenticate", "Bearer")
+		const bearerPrefix = "Bearer "
+		if apiToken != "" && strings.HasPrefix(h, bearerPrefix) && strings.TrimSpace(strings.TrimPrefix(h, bearerPrefix)) == apiToken {
+			authorized = true
+		}
+		if !authorized && basicUser != "" {
+			if user, pass, ok := r.BasicAuth(); ok && user == basicUser && pass == basicPass {
+				authorized = true
+			}
+		}
+
+		if !authorized {
+			w.Header().Set("WWW-Authenticate", "Basic realm=\"retag\", Bearer")
 			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(` + "`" + `{"error":"unauthorized"}` + "`" + `))
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 			return
 		}
+
 		next.ServeHTTP(w, r)
 	})
 }
@@ -314,7 +333,9 @@ func jsonLogMiddleware(jlog *log.Logger, appID, svc string, next http.Handler) h
 			"RemoteAddr":      r.RemoteAddr,
 			"Event":           "request",
 		}
-		if b, err := json.Marshal(reqLog); err == nil { jlog.Println(string(b)) }
+		if b, err := json.Marshal(reqLog); err == nil {
+			jlog.Println(string(b))
+		}
 
 		// response capture
 		rec := &respRecorder{ResponseWriter: w, status: 200}
@@ -340,7 +361,9 @@ func jsonLogMiddleware(jlog *log.Logger, appID, svc string, next http.Handler) h
 			"ResponseTime": elapsed,
 			"Event":        "response",
 		}
-		if b, err := json.Marshal(respLog); err == nil { jlog.Println(string(b)) }
+		if b, err := json.Marshal(respLog); err == nil {
+			jlog.Println(string(b))
+		}
 	})
 }
 
