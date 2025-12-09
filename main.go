@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,7 +24,7 @@ type RetagRequest struct {
 	Src    string `json:"src"`
 	Dest   string `json:"dest"`
 	DryRun bool   `json:"dry_run"`
-	Login *struct {
+	Login  *struct {
 		Registry string `json:"registry"`
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -43,6 +44,24 @@ type CommandResult struct {
 	Stdout string `json:"stdout"`
 	Stderr string `json:"stderr"`
 	Code   int    `json:"code"`
+}
+
+type QRValidationRequest struct {
+	QR string `json:"qr"`
+}
+
+type QRValidationResponse struct {
+	OK        bool       `json:"ok"`
+	Message   string     `json:"message,omitempty"`
+	Fields    []EMVField `json:"fields,omitempty"`
+	CRCValid  bool       `json:"crc_valid"`
+	RequestID string     `json:"request_id"`
+}
+
+type EMVField struct {
+	ID       string     `json:"id"`
+	Value    string     `json:"value,omitempty"`
+	Children []EMVField `json:"children,omitempty"`
 }
 
 // ===== main =====
@@ -99,7 +118,8 @@ func main() {
 				results = append(results, cr)
 				if cr.Code != 0 {
 					resp := RetagResponse{OK: false, Message: "docker login failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-					writeJSON(w, http.StatusUnauthorized, resp); return
+					writeJSON(w, http.StatusUnauthorized, resp)
+					return
 				}
 			}
 		} else if envHasLogin() {
@@ -114,7 +134,8 @@ func main() {
 					results = append(results, cr)
 					if cr.Code != 0 {
 						resp := RetagResponse{OK: false, Message: "docker login failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-						writeJSON(w, http.StatusUnauthorized, resp); return
+						writeJSON(w, http.StatusUnauthorized, resp)
+						return
 					}
 				}
 			}
@@ -127,7 +148,8 @@ func main() {
 			results = append(results, run(ctx, "docker", "pull", req.Src))
 			if results[len(results)-1].Code != 0 {
 				resp := RetagResponse{OK: false, Message: "docker pull failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-				writeJSON(w, http.StatusBadGateway, resp); return
+				writeJSON(w, http.StatusBadGateway, resp)
+				return
 			}
 		}
 
@@ -138,7 +160,8 @@ func main() {
 			results = append(results, run(ctx, "docker", "tag", req.Src, req.Dest))
 			if results[len(results)-1].Code != 0 {
 				resp := RetagResponse{OK: false, Message: "docker tag failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-				writeJSON(w, http.StatusBadGateway, resp); return
+				writeJSON(w, http.StatusBadGateway, resp)
+				return
 			}
 		}
 
@@ -146,15 +169,57 @@ func main() {
 		if req.DryRun {
 			results = append(results, CommandResult{Cmd: fmt.Sprintf("docker push %s", req.Dest)})
 			resp := RetagResponse{OK: true, Message: "dry-run ok", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-			writeJSON(w, http.StatusOK, resp); return
+			writeJSON(w, http.StatusOK, resp)
+			return
 		}
 		results = append(results, run(ctx, "docker", "push", req.Dest))
 		if results[len(results)-1].Code != 0 {
 			resp := RetagResponse{OK: false, Message: "docker push failed", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
-			writeJSON(w, http.StatusBadGateway, resp); return
+			writeJSON(w, http.StatusBadGateway, resp)
+			return
 		}
 
 		resp := RetagResponse{OK: true, Message: "retag + push success", Commands: results, Elapsed: time.Since(start).String(), RequestID: getReqID(r.Context())}
+		writeJSON(w, http.StatusOK, resp)
+	})))
+
+	// POST /qris/validate - parse EMV QR (QRIS)
+	mux.Handle("/qris/validate", authMiddleware(apiToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		defer r.Body.Close()
+
+		var req QRValidationRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json: " + err.Error()})
+			return
+		}
+
+		qrString := strings.TrimSpace(req.QR)
+		if qrString == "" {
+			writeJSON(w, http.StatusBadRequest, QRValidationResponse{OK: false, Message: "qr is required", RequestID: getReqID(r.Context())})
+			return
+		}
+
+		fields, err := parseEMV(qrString)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, QRValidationResponse{OK: false, Message: err.Error(), RequestID: getReqID(r.Context())})
+			return
+		}
+
+		crcOK, crcErr := validateCRC(qrString)
+		resp := QRValidationResponse{
+			OK:        true,
+			Fields:    fields,
+			CRCValid:  crcOK,
+			RequestID: getReqID(r.Context()),
+		}
+		if crcErr != nil {
+			resp.Message = crcErr.Error()
+		}
+
 		writeJSON(w, http.StatusOK, resp)
 	})))
 
@@ -188,6 +253,75 @@ func validateReq(req RetagRequest) error {
 		return errors.New("dest must include a tag, e.g. my.registry/repo:newtag")
 	}
 	return nil
+}
+
+func parseEMV(payload string) ([]EMVField, error) {
+	fields := []EMVField{}
+	for i := 0; i < len(payload); {
+		if i+4 > len(payload) {
+			return nil, fmt.Errorf("truncated tag at position %d", i)
+		}
+
+		tag := payload[i : i+2]
+		lengthStr := payload[i+2 : i+4]
+		length, err := strconv.Atoi(lengthStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid length for tag %s: %w", tag, err)
+		}
+		i += 4
+
+		if i+length > len(payload) {
+			return nil, fmt.Errorf("value for tag %s truncated", tag)
+		}
+
+		value := payload[i : i+length]
+		i += length
+
+		if isTemplateTag(tag) {
+			children, err := parseEMV(value)
+			if err != nil {
+				return nil, err
+			}
+			fields = append(fields, EMVField{ID: tag, Children: children})
+			continue
+		}
+
+		fields = append(fields, EMVField{ID: tag, Value: value})
+	}
+
+	return fields, nil
+}
+
+func validateCRC(payload string) (bool, error) {
+	idx := strings.LastIndex(payload, "63")
+	if idx == -1 || len(payload) < idx+4 {
+		return false, errors.New("crc tag (63) not found")
+	}
+
+	length, err := strconv.Atoi(payload[idx+2 : idx+4])
+	if err != nil {
+		return false, fmt.Errorf("invalid crc length: %w", err)
+	}
+	if length != 4 {
+		return false, fmt.Errorf("unexpected crc length: %d", length)
+	}
+	if len(payload) < idx+4+length {
+		return false, errors.New("crc value truncated")
+	}
+
+	crcData := payload[:idx+4]
+	computed := fmt.Sprintf("%04X", crc16IBM([]byte(crcData)))
+	provided := strings.ToUpper(payload[idx+4 : idx+4+length])
+
+	return provided == computed, nil
+}
+
+func isTemplateTag(tag string) bool {
+	n, err := strconv.Atoi(tag)
+	if err != nil {
+		return false
+	}
+	return (n >= 26 && n <= 51) || tag == "62" || tag == "64"
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -225,7 +359,7 @@ func authMiddleware(apiToken string, next http.Handler) http.Handler {
 		if !strings.HasPrefix(h, pfx) || strings.TrimSpace(strings.TrimPrefix(h, pfx)) != apiToken {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(` + "`" + `{"error":"unauthorized"}` + "`" + `))
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -314,7 +448,9 @@ func jsonLogMiddleware(jlog *log.Logger, appID, svc string, next http.Handler) h
 			"RemoteAddr":      r.RemoteAddr,
 			"Event":           "request",
 		}
-		if b, err := json.Marshal(reqLog); err == nil { jlog.Println(string(b)) }
+		if b, err := json.Marshal(reqLog); err == nil {
+			jlog.Println(string(b))
+		}
 
 		// response capture
 		rec := &respRecorder{ResponseWriter: w, status: 200}
@@ -340,7 +476,9 @@ func jsonLogMiddleware(jlog *log.Logger, appID, svc string, next http.Handler) h
 			"ResponseTime": elapsed,
 			"Event":        "response",
 		}
-		if b, err := json.Marshal(respLog); err == nil { jlog.Println(string(b)) }
+		if b, err := json.Marshal(respLog); err == nil {
+			jlog.Println(string(b))
+		}
 	})
 }
 
@@ -380,6 +518,24 @@ func maskJSON(v any) {
 		}
 	default:
 	}
+}
+
+func crc16IBM(data []byte) uint16 {
+	const poly = 0x1021
+	crc := uint16(0xFFFF)
+
+	for _, b := range data {
+		crc ^= uint16(b) << 8
+		for i := 0; i < 8; i++ {
+			if crc&0x8000 != 0 {
+				crc = (crc << 1) ^ poly
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+
+	return crc
 }
 
 // run docker CLI
